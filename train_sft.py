@@ -1,10 +1,13 @@
-# train_sft.py
+# train_sft.py（修改版）
 import torch
 from unsloth import FastLanguageModel
 from datasets import Dataset
 from trl import SFTTrainer
 from transformers import TrainingArguments
 import json
+
+# ★★ 全流程唯一的系统提示：必须和 prepare_data.py(instruction)、train_dpo.py(SYSTEM)、serve.py 逐字一致 ★★
+SYSTEM = "你是一名专业的电商平台客服，请用耐心、专业、有同理心的态度回答用户问题。"
 
 # ===== 1. 加载模型（自动量化到4bit，显存友好）=====
 model, tokenizer = FastLanguageModel.from_pretrained(
@@ -32,18 +35,27 @@ model = FastLanguageModel.get_peft_model(
 
 # ===== 3. 准备数据 =====
 def format_prompt(example):
-    """把数据格式化成模型输入"""
+    """把数据格式化成模型输入（ChatML，与 DPO/serve 保持一致）"""
     text = f"""<|im_start|>system
-你是一名专业的电商平台客服，请用耐心、专业、有同理心的态度回答用户问题。<|im_end|>
+{SYSTEM}<|im_end|>
 <|im_start|>user
 {example['input']}<|im_end|>
 <|im_start|>assistant
 {example['output']}<|im_end|>"""
     return {"text": text}
 
-# 加载数据
-with open("data/train.json", "r", encoding="utf-8") as f:
-    train_data = json.load(f)
+# ★ 新版数据是 JSONL（每行一个对象），路径在 data/data/，不能再用 json.load
+def read_jsonl(path):
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+train_data = read_jsonl("data/data/train.jsonl")
+print(f"训练样本: {len(train_data)} 条")
 
 dataset = Dataset.from_list(train_data)
 dataset = dataset.map(format_prompt)
@@ -60,12 +72,14 @@ trainer = SFTTrainer(
         per_device_train_batch_size = 2,
         gradient_accumulation_steps = 4,   # 等效batch=8
         warmup_steps = 50,
-        num_train_epochs = 2,
+        num_train_epochs = 3,              # ★ 数据换成干净多样的了，旧"epoch=2防过拟合"的理由已失效；
+                                           #   先训 3 个 epoch、每轮存一份，之后用测试集 loss 挑最优 epoch
         learning_rate = 2e-4,
         fp16 = not torch.cuda.is_bf16_supported(),
         bf16 = torch.cuda.is_bf16_supported(),
         logging_steps = 20,
-        save_steps = 200,
+        save_strategy = "epoch",           # ★ 每个 epoch 存一份 checkpoint（替代原 save_steps=200），
+                                           #   方便日后用 eval_loss.py 在测试集上挑 epoch
         output_dir = "output/sft_checkpoints",
         optim = "adamw_8bit",              # 8bit优化器，省显存
         report_to = "none",

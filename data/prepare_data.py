@@ -1,69 +1,158 @@
-# prepare_data.py
+"""
+prepare_data.py（方案二·配额版：强制 40% 无订单号，根治幻觉订单号）
+
+为什么前两版没修好：带订单号的问题因订单号随机→唯一性无限，在"凑够2400条"的
+循环里不断被接受；无订单号短问写法有限，去重后很快用光，比例被自动压到个位数。
+本版改为【配额制】：先定死 n_no(无订单号) 与 n_order(带订单号) 的条数，分别生成；
+并用槽位组合把无订单号短问的唯一写法扩到足够多，保证既能撑起比例、又全部唯一(零泄漏)。
+
+无订单号样本的答案：语义锁死在本意图内、只索要订单号、绝不复述/编造订单号。
+"""
 import json
+import os
 import random
+import re
 
-# 客服对话模板 - 覆盖5类常见意图
-templates = {
-    "物流查询": [
-        ("我的订单什么时候能到？", "您好！请提供一下您的订单号，我来帮您查询实时物流状态。通常标准配送需要3-5个工作日，如有延误我们会及时为您跟进。"),
-        ("快递三天了还没动静", "非常抱歉给您带来困扰！请把订单号发给我，我立即联系物流方为您查明情况，并优先处理。"),
-        ("我的包裹显示已签收但没收到", "这种情况非常抱歉！可能是快递员代签或放在门卫处。请您先确认一下周围是否有代收，若确认未收到请告知订单号，我们将启动丢件理赔流程。"),
-    ],
-    "退换货": [
-        ("我想退货", "您好！很抱歉商品未能满足您的需求。请问退货原因是什么呢？我来为您确认是否在退货期内，并指导您完成退货流程。"),
-        ("收到的东西是坏的，我要换货", "非常抱歉您收到了有问题的商品！这是我们的失误。请您拍几张商品问题照片发给我，我立即为您安排免费换货，无需您承担任何运费。"),
-        ("买了一周了可以退吗", "您好！我们支持7天无理由退货。您的订单在退货期内，请在APP中申请退货，我们会在24小时内审核通过并安排上门取件。"),
-    ],
-    "商品咨询": [
-        ("这个手机支持5G吗", "您好！这款手机支持5G网络，兼容SA和NSA双模，支持国内主流运营商全频段，日常使用完全没问题。"),
-        ("这件衣服的尺码怎么选", "您好！建议您参考商品详情页的尺码表，对照自己的身高体重选择。如果您平时偏好宽松穿着，可以选大一码。如需进一步建议请告诉我您的身高体重～"),
-        ("有赠品吗", "您好！目前这款商品参与满减活动，购买即赠XX礼品，活动截止到本月底。现在下单非常划算哦！"),
-    ],
-    "投诉建议": [
-        ("你们服务太差了！", "非常抱歉给您带来了不好的体验，我们深感歉意。请告诉我具体遇到了什么问题，我会优先为您处理，并将您的反馈提交给相关部门改进。"),
-        ("等了半小时没人接电话", "非常抱歉让您久等了！近期咨询量较大，我们的响应速度确实有所下降。您的问题我来立即处理，并会向团队反馈改善响应时效。"),
-        ("你们的APP老是崩溃", "非常抱歉给您带来不便！请问您使用的是什么手机型号和APP版本？建议您先尝试更新到最新版本。我会将这个问题反馈给技术团队优先修复。"),
-    ],
-    "售后问题": [
-        ("保修期是多久", "您好！本商品享受官方1年质保服务。质保期内出现非人为损坏，我们提供免费维修或换新服务，您只需联系我们提交报修申请即可。"),
-        ("维修要多久", "您好！一般维修周期为5-7个工作日。如果配件充足可能更快完成。维修期间我们会全程通知您进度，请放心。"),
-        ("发票怎么开", "您好！您可以在订单详情页点击'申请发票'，填写开票信息后24小时内会发送到您的邮箱。如需纸质发票请提前说明，我们会随商品一起寄出。"),
-    ]
-}
+random.seed(42)
 
-def generate_dataset(output_file, num_samples=2000):
-    data = []
-    intent_list = list(templates.keys())
-    
-    for _ in range(num_samples):
-        intent = random.choice(intent_list)
-        question, answer = random.choice(templates[intent])
-        
-        # 构造 Alpaca 格式
-        item = {
-            "instruction": f"你是一名专业的电商平台客服，请用耐心、专业、有同理心的态度回答用户问题。",
-            "input": question,
-            "output": answer,
-            "intent": intent  # 保留意图标签，用于评测
-        }
-        data.append(item)
-    
-    # 打乱顺序
-    random.shuffle(data)
-    
-    # 分训练集和测试集
-    split = int(len(data) * 0.9)
-    train_data = data[:split]
-    test_data = data[split:]
-    
-    with open(f"data/train.json", "w", encoding="utf-8") as f:
-        json.dump(train_data, f, ensure_ascii=False, indent=2)
-    
-    with open(f"data/test.json", "w", encoding="utf-8") as f:
-        json.dump(test_data, f, ensure_ascii=False, indent=2)
-    
-    print(f"训练集: {len(train_data)} 条")
-    print(f"测试集: {len(test_data)} 条")
-    print("数据生成完成！")
+OUT_DIR = "data/data"
+SYSTEM = "你是一名专业的电商平台客服，请用耐心、专业、有同理心的态度回答用户问题。"
+NO_ORDER_RATIO = 0.40
 
-generate_dataset("data/dataset.json")
+ORDER_NO = lambda: "".join(random.choices("0123456789", k=random.choice([12, 15, 18])))
+PRODUCTS = ["蓝牙耳机", "保温杯", "运动鞋", "充电宝", "护肤套装", "机械键盘",
+            "羽绒服", "猫粮", "台灯", "行李箱", "电饭煲", "瑜伽垫"]
+DAYS = ["昨天", "前天", "三天前", "上周一", "5 天前", "一周前"]
+ASK_NO = "麻烦您提供一下订单号，我好为您精准查询和处理。"
+
+
+# ============ 无订单号：每个意图返回 (问题, 答案, 意图) ；答案只索要不复述 ============
+def no_logistics():
+    subj = random.choice(["我的", "我买的", "我下单的", "我那个", ""])
+    obj = random.choice(["订单", "快递", "包裹", "东西", "货"])
+    ask = random.choice(["到哪了", "怎么还没到", "什么时候到", "发货了吗", "怎么还没发货", "物流不动了", "还要多久"])
+    q = f"{subj}{obj}{ask}"
+    a = f"您好！很乐意为您查询物流进度。{ASK_NO}"
+    return q, a, "物流查询"
+
+def no_return():
+    act = random.choice(["退货", "退款", "换货", "退掉"])
+    tmpl = random.choice([f"我要{act}", f"可以{act}吗", f"怎么{act}", f"{act}流程是什么",
+                          f"想{act}怎么办", f"这个能{act}吗", f"{random.choice(PRODUCTS)}想{act}"])
+    a = (f"您好！很抱歉商品未能满足您的需求，我来协助您办理退换。"
+         f"请问您遇到的具体问题是什么呢？另外{ASK_NO}")
+    return tmpl, a, "退换货"
+
+def no_consult():
+    p = random.choice(PRODUCTS)
+    asp = random.choice(["支持5G吗", "尺码怎么选", "材质是什么", "保质期多久", "有没有赠品",
+                         "怎么保养", "能用多久", "值不值得买", "防水吗", "有几种颜色"])
+    q = random.choice([f"这个{p}{asp}", f"{p}{asp}", f"想问下{asp}", f"请问{p}{asp}"])
+    a = random.choice([
+        f"您好！关于「{asp}」，详情页有完整参数；为避免给您错误信息，具体请以商品详情页和官方参数为准，我也可以帮您逐项核对。",
+        f"您好！这个问题我帮您确认一下；如果方便告诉我您的具体使用场景或需求，我可以给更贴合的建议。",
+    ])
+    return q, a, "商品咨询"
+
+def no_complaint():
+    issue = random.choice(["服务太差了", "等了半小时没人接", "APP 老是崩溃", "发货太慢",
+                           "客服态度敷衍", "问题一直没解决", "联系好几次没人管", "体验很糟糕"])
+    q = random.choice([f"你们{issue}！", f"{issue}，我要投诉", f"对你们很失望，{issue}", f"{issue}"])
+    a = (f"非常抱歉给您带来了不好的体验，「{issue}」确实是我们的问题，向您致歉。"
+         f"您的情况我现在优先处理，同时反馈给相关团队改进，避免再次发生。")
+    return q, a, "投诉建议"
+
+def no_aftersale():
+    p = random.choice(PRODUCTS)
+    topic = random.choice(["保修期是多久", "维修要多久", "怎么开发票", "过保了还能修吗",
+                           "怎么报修", "能保修吗", "保修怎么算", "发票怎么开"])
+    q = random.choice([topic, f"{p}{topic}"])
+    if "过保" in q:
+        a = f"您好！若已过质保或属人为损坏，通常不在免费保修范围内，但可提供付费维修方案，{ASK_NO}我帮您评估报价。"
+    elif "发票" in q:
+        a = f"您好！电子发票可在订单详情页点击「申请发票」填写抬头，24 小时内发至邮箱；{ASK_NO}"
+    else:
+        a = f"您好！本商品享受官方质保，质保期内非人为损坏可免费维修或换新，一般周期 5-7 个工作日。{ASK_NO}"
+    return q, a, "售后问题"
+
+NO_ORDER_GENS = [no_logistics, no_return, no_consult, no_complaint, no_aftersale]
+
+
+# ============ 带订单号：答案复述真实订单号 ============
+def ord_logistics():
+    p, no, d = random.choice(PRODUCTS), ORDER_NO(), random.choice(DAYS)
+    q = random.choice([f"我{d}买的{p}到哪了，订单号{no}", f"订单{no}的{p}怎么还没发货",
+                       f"{p}的快递好几天没更新了，单号{no}"])
+    a = random.choice([
+        f"您好！已为您查询订单{no}，{p}目前在运输途中，预计 1-2 天内送达，有更新会第一时间通知您。",
+        f"非常抱歉让您久等！订单{no}的{p}我已为您催促仓库加急发货，发出后同步单号给您。",
+    ])
+    return q, a, "物流查询"
+
+def ord_return():
+    p, no = random.choice(PRODUCTS), ORDER_NO()
+    cond = random.choice(["用了几天觉得不合适", "买错型号了", "收到就是坏的", "颜色和图片不符"])
+    bad = ("坏的" in cond) or ("不符" in cond)
+    q = f"订单{no}的{p}我想退货，{cond}"
+    if bad:
+        a = (f"非常抱歉给您带来困扰！订单{no}的{p}属于质量/描述问题，由我们承担退换运费，"
+             f"麻烦您拍 1-2 张问题照片发来，我立即为您安排退换。")
+    else:
+        a = (f"您好！是否可退要看订单{no}是否在 7 天无理由期内及商品状态，"
+             f"我先帮您核实时效，符合条件就指导您申请，不符合也会给您其他方案。")
+    return q, a, "退换货"
+
+def ord_aftersale():
+    p, no = random.choice(PRODUCTS), ORDER_NO()
+    topic = random.choice(["保修期是多久", "维修要多久", "怎么开发票"])
+    if topic == "怎么开发票":
+        q = f"订单{no}怎么开发票"
+        a = f"您好！订单{no}可在订单详情页点击「申请发票」填写抬头，电子发票 24 小时内发至您邮箱；需要纸质发票请告知。"
+    else:
+        q = f"{p}{topic}？订单{no}"
+        a = f"您好！订单{no}的{p}享受官方质保，质保期内非人为损坏可免费维修或换新，一般周期 5-7 个工作日。"
+    return q, a, "售后问题"
+
+ORDER_GENS = [ord_logistics, ord_return, ord_aftersale]
+
+
+def collect(gens, target, seen):
+    out, guard = [], 0
+    while len(out) < target and guard < target * 200:
+        guard += 1
+        q, a, intent = random.choice(gens)()
+        if q in seen:
+            continue
+        seen.add(q)
+        out.append({"instruction": SYSTEM, "input": q, "output": a, "intent": intent})
+    return out
+
+
+def generate(n_total=2400, test_ratio=0.1):
+    n_no = int(n_total * NO_ORDER_RATIO)
+    n_ord = n_total - n_no
+    seen = set()
+    items = collect(NO_ORDER_GENS, n_no, seen) + collect(ORDER_GENS, n_ord, seen)
+    random.shuffle(items)
+
+    split = int(len(items) * (1 - test_ratio))
+    train, test = items[:split], items[split:]
+    train_q = {it["input"] for it in train}
+    leaked = [it for it in test if it["input"] in train_q]
+    assert not leaked, f"泄漏 {len(leaked)} 条"
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for name, rows in [("train", train), ("test", test)]:
+        with open(f"{OUT_DIR}/{name}.jsonl", "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    has_order = lambda s: bool(re.search(r"\d{12,}", s))
+    no = sum(1 for it in items if not has_order(it["input"]))
+    print(f"唯一样本: {len(items)}（无订单号 {no} 条 = {no/len(items)*100:.0f}%）")
+    print(f"训练集: {len(train)}  测试集: {len(test)}  泄漏: {len(leaked)}")
+    print(f"输出: {OUT_DIR}/train.jsonl, {OUT_DIR}/test.jsonl")
+
+
+if __name__ == "__main__":
+    generate()
